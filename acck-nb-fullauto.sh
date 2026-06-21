@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# 3proxy SOCKS5 full-auto installer for game/high concurrency use
+# 3proxy SOCKS5 full-auto installer - generic version
 # Defaults: port 10898, user nb, password nb, maxconn 100000
+# Generic IP binding is disabled by default. Enable only when you explicitly set a range/prefix/CIDR.
 
 set -Eeuo pipefail
 
-VERSION="0.9.4"
+VERSION="${VERSION:-0.9.4}"
 SERVICE="3proxy"
 CONFIG_FILE="/etc/3proxy.cfg"
 INSTALL_PATH="/usr/local/bin/3proxy"
@@ -16,15 +17,31 @@ STATE_DIR="/etc/3proxy-auto"
 STATE_FILE="${STATE_DIR}/install.env"
 SELF_PATH="/root/acck.sh"
 
-# ===== 默认配置 =====
+# ===== default proxy config =====
 DEFAULT_PORT="10898"
 DEFAULT_USER="nb"
 DEFAULT_PASS="nb"
 DEFAULT_MAXCONN="100000"
-DEFAULT_MODE="auto"      # auto: 多公网IP => 多IP出口；单公网IP => -i0.0.0.0
-ENABLE_LOG="n"           # 高并发默认关闭访问日志
+DEFAULT_MODE="auto"      # auto: multi public IPs => multiip; one public IP => wildcard
+ENABLE_LOG="${ENABLE_LOG:-n}"
 
-# ===== 高并发参数 =====
+# ===== optional generic IPv4 bind config =====
+# Default is disabled and no IP segment is hard-coded.
+# Examples:
+#   BIND_ENABLE=y BIND_IPV4_PREFIX=108.187.244 BIND_START=1 BIND_END=254 bash acck.sh --auto
+#   BIND_ENABLE=y BIND_IPV4_CIDR=108.187.244.0/24 bash acck.sh --auto
+BIND_ENABLE="${BIND_ENABLE:-n}"
+BIND_IPV4_PREFIX="${BIND_IPV4_PREFIX:-}"
+BIND_IPV4_CIDR="${BIND_IPV4_CIDR:-}"
+BIND_START="${BIND_START:-1}"
+BIND_END="${BIND_END:-254}"
+BIND_DEV="${BIND_DEV:-auto}"
+BIND_ONLY_RANGE="${BIND_ONLY_RANGE:-n}"  # y: config uses only bound range; n: config uses all public-like IPv4s
+BIND_SCRIPT="/usr/local/sbin/3proxy-bind-ipv4.sh"
+BIND_SERVICE="/etc/systemd/system/3proxy-bind-ipv4.service"
+BIND_DROPIN="/etc/systemd/system/${SERVICE}.service.d/10-bind-ipv4.conf"
+
+# ===== high concurrency tuning =====
 NOFILE="524288"
 NROPEN="1048576"
 FILEMAX="8388608"
@@ -40,19 +57,6 @@ WATCHDOG_SCRIPT="/usr/local/bin/3proxy-ip-watchdog.sh"
 WATCHDOG_SERVICE="/etc/systemd/system/3proxy-ip-watchdog.service"
 WATCHDOG_TIMER="/etc/systemd/system/3proxy-ip-watchdog.timer"
 
-# ===== IPv4 段自动绑定配置 =====
-# 默认修复目标：108.187.244.1-254。可在运行前用环境变量覆盖，例如：
-# BIND_IPV4_PREFIX=1.2.3 BIND_START=10 BIND_END=200 bash acck.sh --auto
-BIND_ENABLE="${BIND_ENABLE:-y}"
-BIND_IPV4_PREFIX="${BIND_IPV4_PREFIX:-108.187.244}"
-BIND_START="${BIND_START:-1}"
-BIND_END="${BIND_END:-254}"
-BIND_DEV="${BIND_DEV:-auto}"
-# 默认只把绑定的这个 /24 写进 3proxy 出口，避免把主 IP 也混进代理池。留空则使用全部公网 IP。
-CONFIG_IP_PREFIX="${CONFIG_IP_PREFIX:-$BIND_IPV4_PREFIX}"
-BIND_SCRIPT="/usr/local/sbin/3proxy-bind-ipv4.sh"
-BIND_SERVICE="/etc/systemd/system/3proxy-bind-ipv4.service"
-
 PORT="$DEFAULT_PORT"
 USER_NAME="$DEFAULT_USER"
 USER_PASS="$DEFAULT_PASS"
@@ -67,12 +71,40 @@ has_cmd(){ command -v "$1" >/dev/null 2>&1; }
 
 need_root(){
   if [[ ${EUID} -ne 0 ]]; then
-    red "请用 root 运行：sudo bash $0"
+    red "Please run as root: sudo bash $0"
     exit 1
   fi
 }
 
-pause(){ echo; read -r -p "按 Enter 返回菜单..." _ || true; }
+pause(){ echo; read -r -p "Press Enter to return to menu..." _ || true; }
+
+usage(){
+  cat <<EOF_USAGE
+Usage:
+  bash acck.sh --auto
+  bash acck.sh --regen
+  bash acck.sh --bind
+  bash acck.sh --bindfix
+  bash acck.sh --status
+  bash acck.sh --info
+
+Generic IP binding is disabled by default.
+Enable binding with environment variables:
+
+  BIND_ENABLE=y BIND_IPV4_PREFIX=108.187.244 BIND_START=1 BIND_END=254 bash acck.sh --auto
+  BIND_ENABLE=y BIND_IPV4_CIDR=108.187.244.0/24 bash acck.sh --auto
+
+Optional variables:
+  BIND_DEV=eno1              # default: auto
+  BIND_ONLY_RANGE=y          # config uses only the configured bind range
+  PORT=10898 USER_NAME=nb USER_PASS=nb MAXCONN=100000 MODE=auto bash acck.sh --auto
+
+Modes:
+  auto      multi public IPs => per-IP socks lines; single public IP => wildcard
+  multiip   force per-IP socks lines
+  wildcard  one socks line, bind on 0.0.0.0
+EOF_USAGE
+}
 
 pkg_install(){
   if has_cmd apt-get; then
@@ -84,13 +116,13 @@ pkg_install(){
   elif has_cmd yum; then
     yum install -y "$@"
   else
-    red "未找到 apt-get/dnf/yum，无法自动安装依赖。"
+    red "No apt-get/dnf/yum found. Cannot install dependencies automatically."
     exit 1
   fi
 }
 
 install_deps(){
-  info "安装依赖..."
+  info "Installing dependencies..."
   if has_cmd apt-get; then
     pkg_install ca-certificates wget curl tar make gcc build-essential openssl iproute2 procps gawk
   else
@@ -105,6 +137,7 @@ is_private_ipv4(){
   [[ "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. ]] && return 0
   [[ "$ip" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]] && return 0
   [[ "$ip" =~ ^169\.254\. ]] && return 0
+  [[ "$ip" =~ ^127\. ]] && return 0
   return 1
 }
 
@@ -122,120 +155,50 @@ get_public_like_ipv4(){
 
 current_public_ip(){ curl -4 -sS --connect-timeout 5 https://api.ipify.org 2>/dev/null || true; }
 
-
 detect_default_dev(){
-  if [[ "${BIND_DEV:-auto}" != "auto" && -n "${BIND_DEV:-}" ]]; then
-    echo "$BIND_DEV"
-    return 0
-  fi
   ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
 }
 
-valid_ipv4_prefix3(){
-  local p="$1" a b c
-  [[ "$p" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
-  IFS=. read -r a b c <<< "$p"
-  for x in "$a" "$b" "$c"; do
-    [[ "$x" =~ ^[0-9]+$ ]] || return 1
-    (( x >= 0 && x <= 255 )) || return 1
-  done
-  return 0
-}
+normalize_bind_settings(){
+  BIND_ENABLE="${BIND_ENABLE:-n}"
+  BIND_IPV4_PREFIX="${BIND_IPV4_PREFIX:-}"
+  BIND_IPV4_CIDR="${BIND_IPV4_CIDR:-}"
+  BIND_START="${BIND_START:-1}"
+  BIND_END="${BIND_END:-254}"
+  BIND_DEV="${BIND_DEV:-auto}"
+  BIND_ONLY_RANGE="${BIND_ONLY_RANGE:-n}"
 
-get_config_ipv4(){
-  local prefix_re
-  if [[ -n "${CONFIG_IP_PREFIX:-}" ]]; then
-    prefix_re="^${CONFIG_IP_PREFIX//./\\.}\."
-    get_public_like_ipv4 | grep -E "$prefix_re" | sort -V -u || true
-  else
-    get_public_like_ipv4 | sort -V -u || true
+  if [[ -n "$BIND_IPV4_CIDR" && -z "$BIND_IPV4_PREFIX" ]]; then
+    if [[ "$BIND_IPV4_CIDR" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.0/24$ ]]; then
+      BIND_IPV4_PREFIX="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+      BIND_START="1"
+      BIND_END="254"
+    else
+      red "Only /24 CIDR in x.y.z.0/24 format is supported by this script. Given: $BIND_IPV4_CIDR"
+      exit 1
+    fi
   fi
-}
 
-bind_extra_ipv4_now(){
-  load_state
-  [[ "$BIND_ENABLE" =~ ^[Yy]$ ]] || { yellow "已关闭 IPv4 段自动绑定，跳过。"; return 0; }
-  valid_ipv4_prefix3 "$BIND_IPV4_PREFIX" || { red "BIND_IPV4_PREFIX 格式错误，应类似 108.187.244"; return 1; }
-  [[ "$BIND_START" =~ ^[0-9]+$ && "$BIND_END" =~ ^[0-9]+$ ]] || { red "BIND_START/BIND_END 必须是数字"; return 1; }
-  (( BIND_START >= 1 && BIND_END <= 254 && BIND_START <= BIND_END )) || { red "BIND_START/BIND_END 范围错误，应为 1-254"; return 1; }
-
-  local dev count
-  dev="$(detect_default_dev)"
-  [[ -n "$dev" ]] || { red "无法识别默认出口网卡，请设置 BIND_DEV=网卡名 后重试。"; return 1; }
-
-  info "绑定 IPv4 段：${BIND_IPV4_PREFIX}.${BIND_START}-${BIND_END}/32 -> ${dev}"
-  for i in $(seq "$BIND_START" "$BIND_END"); do
-    ip addr add "${BIND_IPV4_PREFIX}.${i}/32" dev "$dev" 2>/dev/null || true
-  done
-  count="$(ip -4 -o addr show dev "$dev" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -E "^${BIND_IPV4_PREFIX//./\\.}\." | wc -l | awk '{print $1}')"
-  green "当前 ${BIND_IPV4_PREFIX}.x 已绑定数量：$count"
-}
-
-write_bind_service(){
-  load_state
-  mkdir -p "$(dirname "$BIND_SCRIPT")" "$OVR_DIR"
-  cat > "$BIND_SCRIPT" <<EOF_BIND_SCRIPT
-#!/usr/bin/env bash
-set -Eeuo pipefail
-BIND_IPV4_PREFIX="${BIND_IPV4_PREFIX}"
-BIND_START="${BIND_START}"
-BIND_END="${BIND_END}"
-BIND_DEV="${BIND_DEV}"
-
-if [[ "\$BIND_DEV" == "auto" || -z "\$BIND_DEV" ]]; then
-  DEV="\$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i=="dev"){print \$(i+1); exit}}')"
-else
-  DEV="\$BIND_DEV"
-fi
-
-[[ -n "\$DEV" ]] || { echo "无法识别默认出口网卡" >&2; exit 1; }
-
-for i in \$(seq "\$BIND_START" "\$BIND_END"); do
-  ip addr add "\${BIND_IPV4_PREFIX}.\${i}/32" dev "\$DEV" 2>/dev/null || true
-done
-
-ip -4 -o addr show dev "\$DEV" scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | grep -E "^\${BIND_IPV4_PREFIX//./\\.}\." | sort -V | wc -l | awk '{print "bound_count="\$1}'
-EOF_BIND_SCRIPT
-  chmod +x "$BIND_SCRIPT"
-
-  cat > "$BIND_SERVICE" <<EOF_BIND_SERVICE
-[Unit]
-Description=Bind IPv4 range for 3proxy
-After=network-online.target
-Wants=network-online.target
-Before=${SERVICE}.service
-
-[Service]
-Type=oneshot
-ExecStart=${BIND_SCRIPT}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_BIND_SERVICE
-
-  cat > "${OVR_DIR}/10-bind-ip.conf" <<EOF_BIND_DROPIN
-[Unit]
-Requires=3proxy-bind-ipv4.service
-After=3proxy-bind-ipv4.service
-EOF_BIND_DROPIN
-
-  systemctl daemon-reload
-  systemctl enable 3proxy-bind-ipv4.service >/dev/null 2>&1 || true
-  green "开机自动绑定服务已写入：3proxy-bind-ipv4.service"
-}
-
-setup_ip_binding(){
-  load_state
-  [[ "$BIND_ENABLE" =~ ^[Yy]$ ]] || return 0
-  write_bind_service
-  systemctl start 3proxy-bind-ipv4.service || bind_extra_ipv4_now
-  bind_extra_ipv4_now
+  if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    if [[ -z "$BIND_IPV4_PREFIX" ]]; then
+      red "BIND_ENABLE=y requires BIND_IPV4_PREFIX=x.y.z or BIND_IPV4_CIDR=x.y.z.0/24"
+      exit 1
+    fi
+    if ! [[ "$BIND_START" =~ ^[0-9]+$ && "$BIND_END" =~ ^[0-9]+$ ]]; then
+      red "BIND_START and BIND_END must be numbers."
+      exit 1
+    fi
+    if (( BIND_START < 0 || BIND_END > 255 || BIND_START > BIND_END )); then
+      red "Invalid range: BIND_START=$BIND_START BIND_END=$BIND_END"
+      exit 1
+    fi
+  fi
 }
 
 save_state(){
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+  normalize_bind_settings
   cat > "$STATE_FILE" <<EOF_STATE
 PORT='$PORT'
 USER_NAME='$USER_NAME'
@@ -245,10 +208,11 @@ MODE='$MODE'
 ENABLE_LOG='$ENABLE_LOG'
 BIND_ENABLE='$BIND_ENABLE'
 BIND_IPV4_PREFIX='$BIND_IPV4_PREFIX'
+BIND_IPV4_CIDR='$BIND_IPV4_CIDR'
 BIND_START='$BIND_START'
 BIND_END='$BIND_END'
 BIND_DEV='$BIND_DEV'
-CONFIG_IP_PREFIX='$CONFIG_IP_PREFIX'
+BIND_ONLY_RANGE='$BIND_ONLY_RANGE'
 EOF_STATE
   chmod 600 "$STATE_FILE"
 }
@@ -264,17 +228,12 @@ load_state(){
   MAXCONN="${MAXCONN:-$DEFAULT_MAXCONN}"
   MODE="${MODE:-$DEFAULT_MODE}"
   ENABLE_LOG="${ENABLE_LOG:-n}"
-  BIND_ENABLE="${BIND_ENABLE:-y}"
-  BIND_IPV4_PREFIX="${BIND_IPV4_PREFIX:-108.187.244}"
-  BIND_START="${BIND_START:-1}"
-  BIND_END="${BIND_END:-254}"
-  BIND_DEV="${BIND_DEV:-auto}"
-  CONFIG_IP_PREFIX="${CONFIG_IP_PREFIX:-$BIND_IPV4_PREFIX}"
+  normalize_bind_settings
 }
 
 effective_mode(){
   local count
-  count="$(get_config_ipv4 | wc -l | awk '{print $1}')"
+  count="$(get_config_ipv4_list | wc -l | awk '{print $1}')"
   if [[ "$MODE" == "auto" ]]; then
     if (( count >= 2 )); then echo "multiip"; else echo "wildcard"; fi
   else
@@ -282,11 +241,111 @@ effective_mode(){
   fi
 }
 
+get_bound_range_ipv4(){
+  normalize_bind_settings
+  [[ -n "$BIND_IPV4_PREFIX" ]] || return 0
+  local pattern="^${BIND_IPV4_PREFIX//./\\.}\."
+  get_public_like_ipv4 | grep -E "$pattern" | sort -V -u || true
+}
+
+get_config_ipv4_list(){
+  load_state >/dev/null 2>&1 || true
+  if [[ "$BIND_ONLY_RANGE" =~ ^[Yy]$ && -n "$BIND_IPV4_PREFIX" ]]; then
+    get_bound_range_ipv4
+  else
+    get_public_like_ipv4
+  fi
+}
+
+write_bind_script(){
+  load_state
+  if ! [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    yellow "IP binding is disabled. Set BIND_ENABLE=y and BIND_IPV4_PREFIX or BIND_IPV4_CIDR to enable."
+    return 0
+  fi
+
+  local dev="$BIND_DEV"
+  if [[ "$dev" == "auto" || -z "$dev" ]]; then
+    dev="$(detect_default_dev)"
+  fi
+  [[ -n "$dev" ]] || { red "Cannot detect default network device. Set BIND_DEV=your_device."; exit 1; }
+
+  info "Writing generic IPv4 binding script: prefix=$BIND_IPV4_PREFIX range=$BIND_START-$BIND_END dev=$dev"
+
+  cat > "$BIND_SCRIPT" <<EOF_BIND
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PREFIX="$BIND_IPV4_PREFIX"
+START="$BIND_START"
+END="$BIND_END"
+DEV="$dev"
+
+for i in \$(seq "\$START" "\$END"); do
+  ip addr add "\${PREFIX}.\${i}/32" dev "\$DEV" 2>/dev/null || true
+done
+
+ip -4 -o addr show dev "\$DEV" scope global 2>/dev/null \
+| awk '{print \$4}' \
+| cut -d/ -f1 \
+| grep -E "^${BIND_IPV4_PREFIX//./\\.}\\." \
+| sort -V -u \
+| wc -l \
+| awk '{print "bound_count="\$1}'
+EOF_BIND
+  chmod +x "$BIND_SCRIPT"
+
+  cat > "$BIND_SERVICE" <<EOF_SERVICE
+[Unit]
+Description=Bind generic IPv4 range for 3proxy
+After=network-online.target
+Wants=network-online.target
+Before=3proxy.service
+
+[Service]
+Type=oneshot
+ExecStart=$BIND_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+
+  mkdir -p "$OVR_DIR"
+  cat > "$BIND_DROPIN" <<EOF_DROPIN
+[Unit]
+Requires=3proxy-bind-ipv4.service
+After=3proxy-bind-ipv4.service
+EOF_DROPIN
+
+  systemctl daemon-reload
+  systemctl enable 3proxy-bind-ipv4.service >/dev/null 2>&1 || true
+  save_state
+  green "IP bind service written: 3proxy-bind-ipv4.service"
+}
+
+bind_ipv4_now(){
+  load_state
+  if ! [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    yellow "IP binding is disabled. Nothing to bind."
+    return 0
+  fi
+  write_bind_script
+  info "Binding IPv4 range now..."
+  systemctl restart 3proxy-bind-ipv4.service || "$BIND_SCRIPT"
+}
+
+remove_bind_service(){
+  systemctl disable --now 3proxy-bind-ipv4.service >/dev/null 2>&1 || true
+  rm -f "$BIND_SCRIPT" "$BIND_SERVICE" "$BIND_DROPIN"
+  systemctl daemon-reload
+  green "Generic IP bind service removed. Existing runtime IP addresses are not deleted."
+}
+
 write_config(){
   load_state
   local em ip count
   em="$(effective_mode)"
-  info "生成配置：PORT=$PORT USER=$USER_NAME MAXCONN=$MAXCONN MODE=$MODE -> $em"
+  info "Generating config: PORT=$PORT USER=$USER_NAME MAXCONN=$MAXCONN MODE=$MODE -> $em"
   {
     echo "daemon"
     echo "nscache 65536"
@@ -306,7 +365,7 @@ write_config(){
         [[ -z "$ip" ]] && continue
         echo "socks -p${PORT} -i${ip} -e${ip}"
         count=$((count+1))
-      done < <(get_config_ipv4)
+      done < <(get_config_ipv4_list)
       if (( count == 0 )); then echo "socks -p${PORT} -i0.0.0.0"; fi
     else
       echo "socks -p${PORT} -i0.0.0.0"
@@ -314,11 +373,11 @@ write_config(){
   } > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   save_state
-  green "配置文件已写入：$CONFIG_FILE"
+  green "Config written: $CONFIG_FILE"
 }
 
 build_install_3proxy(){
-  info "下载并编译 3proxy $VERSION..."
+  info "Downloading and compiling 3proxy $VERSION..."
   rm -rf "$BUILD_DIR" "$BUILD_LOG"
   mkdir -p "$BUILD_DIR"
   cd "$BUILD_DIR"
@@ -326,16 +385,16 @@ build_install_3proxy(){
   tar -xzf 3proxy.tar.gz
   cd "3proxy-${VERSION}"
   if ! make -f Makefile.Linux >"$BUILD_LOG" 2>&1; then
-    red "编译失败，日志：$BUILD_LOG"
+    red "Build failed. Log: $BUILD_LOG"
     tail -n 100 "$BUILD_LOG" || true
     exit 1
   fi
   install -m 0755 ./bin/3proxy "$INSTALL_PATH"
-  green "3proxy 已安装到：$INSTALL_PATH"
+  green "3proxy installed: $INSTALL_PATH"
 }
 
 write_service(){
-  info "写入 systemd 服务..."
+  info "Writing systemd service..."
   cat > "$SERVICE_FILE" <<EOF_SERVICE
 [Unit]
 Description=3proxy Proxy Server
@@ -359,7 +418,7 @@ EOF_SERVICE
 }
 
 apply_tuning(){
-  info "应用高并发优化..."
+  info "Applying high concurrency tuning..."
   mkdir -p /etc/sysctl.d "$OVR_DIR"
   cat > "$SYSCTL_FILE" <<EOF_SYSCTL
 fs.nr_open = ${NROPEN}
@@ -389,12 +448,12 @@ TasksMax=infinity
 EOF_OVR
   sysctl -e -p "$SYSCTL_FILE" >/dev/null || true
   systemctl daemon-reload
-  green "高并发优化已启用。"
+  green "High concurrency tuning enabled."
 }
 
 open_firewall(){
   local port="$1"
-  info "自动放行本机防火墙端口 $port，如未启用防火墙则跳过..."
+  info "Opening local firewall port $port when supported..."
   if has_cmd ufw && ufw status 2>/dev/null | grep -qi active; then
     ufw allow "${port}/tcp" || true
   fi
@@ -411,7 +470,7 @@ restart_service(){
 }
 
 install_watchdog(){
-  info "启用 IP 变动检测自动刷新/重启..."
+  info "Enabling IP-change watchdog..."
   cat > "$WATCHDOG_SCRIPT" <<EOF_WD
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -419,11 +478,8 @@ SERVICE="$SERVICE"
 SELF_PATH="$SELF_PATH"
 LAST_LIST="/run/3proxy-ip-list.last"
 current_ips(){
-  ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | sort -u | grep -Ev '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.|169\\.254\\.)' || true
+  ip -4 -o addr show scope global 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | sort -V -u | grep -Ev '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[0-1])\\.|100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.|169\\.254\\.|127\\.)' || true
 }
-if [[ -x "${BIND_SCRIPT}" ]]; then
-  "${BIND_SCRIPT}" >/dev/null 2>&1 || true
-fi
 CUR="\$(current_ips | tr '\n' ' ')"
 [[ -n "\$CUR" ]] || exit 0
 if [[ ! -f "\$LAST_LIST" ]]; then
@@ -465,14 +521,14 @@ WantedBy=timers.target
 EOF_WDT
   systemctl daemon-reload
   systemctl enable --now 3proxy-ip-watchdog.timer >/dev/null 2>&1 || true
-  green "IP 变动检测已启用。"
+  green "IP-change watchdog enabled."
 }
 
 disable_watchdog(){
   systemctl disable --now 3proxy-ip-watchdog.timer >/dev/null 2>&1 || true
   rm -f "$WATCHDOG_SCRIPT" "$WATCHDOG_SERVICE" "$WATCHDOG_TIMER"
   systemctl daemon-reload
-  green "IP 变动检测已关闭。"
+  green "IP-change watchdog disabled."
 }
 
 verify_limits(){
@@ -489,77 +545,88 @@ verify_limits(){
 }
 
 show_status(){
-  echo "==== 3proxy 状态 ===="
+  load_state
+  echo "==== 3proxy status ===="
   systemctl status "$SERVICE" --no-pager || true
   echo
-  echo "==== 监听端口 ===="
+  echo "==== listening ports ===="
   ss -lntp | grep -E "3proxy|:${PORT}" || true
   echo
-  echo "==== IP 变动检测 ===="
+  echo "==== bind service ===="
+  systemctl status 3proxy-bind-ipv4.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
+  echo
+  echo "==== IP-change watchdog ===="
   systemctl list-timers --all 2>/dev/null | grep 3proxy-ip-watchdog || true
 }
 
 show_info(){
   load_state
-  local pub count em
+  local pub count em cfg_count
   pub="$(current_public_ip)"
   count="$(grep -c '^socks ' "$CONFIG_FILE" 2>/dev/null || echo 0)"
+  cfg_count="$(get_config_ipv4_list | wc -l | awk '{print $1}')"
   em="$(effective_mode)"
-  echo "配置文件: $CONFIG_FILE"
-  echo "程序路径: $INSTALL_PATH"
-  echo "代理类型: SOCKS5"
-  echo "端口: $PORT"
-  echo "账号/密码: $USER_NAME/$USER_PASS"
+  echo "config file: $CONFIG_FILE"
+  echo "program path: $INSTALL_PATH"
+  echo "proxy type: SOCKS5"
+  echo "port: $PORT"
+  echo "username/password: $USER_NAME/$USER_PASS"
   echo "maxconn: $MAXCONN"
-  echo "模式: $MODE -> $em"
-  echo "自动绑定: $BIND_ENABLE ${BIND_IPV4_PREFIX}.${BIND_START}-${BIND_END} dev=$BIND_DEV"
-  echo "配置出口过滤: ${CONFIG_IP_PREFIX:-全部公网IP}"
-  echo "socks监听条数: $count"
-  echo "公网IP: ${pub:-检测失败}"
-  echo "本机IPv4:"
+  echo "mode: $MODE -> $em"
+  echo "socks lines: $count"
+  echo "public IP from outside: ${pub:-failed}"
+  echo "config IPv4 count: $cfg_count"
+  echo "bind enable: $BIND_ENABLE"
+  echo "bind prefix/cidr: ${BIND_IPV4_PREFIX:-none} ${BIND_IPV4_CIDR:-}"
+  echo "bind range/dev: $BIND_START-$BIND_END / $BIND_DEV"
+  echo "bind only range: $BIND_ONLY_RANGE"
+  echo "local global IPv4:"
   get_all_global_ipv4 | sed 's/^/  - /' || true
   echo
-  echo "测试命令:"
-  echo "curl -v --socks5 ${USER_NAME}:${USER_PASS}@${pub:-服务器公网IP}:${PORT} http://example.com"
+  echo "test command:"
+  echo "curl -v --socks5 ${USER_NAME}:${USER_PASS}@${pub:-server_public_ip}:${PORT} http://example.com"
 }
 
 test_proxy(){
   load_state
   local pub
   pub="$(current_public_ip)"
-  echo "本机测试 127.0.0.1:${PORT}"
-  curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@127.0.0.1:${PORT}" http://ifconfig.me && echo || red "本机测试失败"
+  echo "Local test 127.0.0.1:${PORT}"
+  curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@127.0.0.1:${PORT}" http://ifconfig.me && echo || red "Local test failed"
   if [[ -n "$pub" ]]; then
-    echo "公网测试 ${pub}:${PORT}"
-    curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@${pub}:${PORT}" http://ifconfig.me && echo || red "公网测试失败：请检查安全组/防火墙"
+    echo "Public test ${pub}:${PORT}"
+    curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@${pub}:${PORT}" http://ifconfig.me && echo || red "Public test failed. Check security group/firewall."
   fi
 }
 
 full_auto_install(){
-  clear
-  echo "--- 3proxy 全默认自动安装 ---"
-  echo "端口=${DEFAULT_PORT} 账号/密码=${DEFAULT_USER}/${DEFAULT_PASS} maxconn=${DEFAULT_MAXCONN} 模式=${DEFAULT_MODE}"
-  echo "自动启用：绑定 108.187.244.1-254、高并发优化、本机防火墙放行、IP变动检测自动刷新/重启。"
+  clear || true
+  echo "--- 3proxy full-auto install - generic version ---"
+  echo "port=${PORT:-$DEFAULT_PORT} user/pass=${USER_NAME:-$DEFAULT_USER}/${USER_PASS:-$DEFAULT_PASS} maxconn=${MAXCONN:-$DEFAULT_MAXCONN} mode=${MODE:-$DEFAULT_MODE}"
+  echo "IP binding default: disabled. Enable with BIND_ENABLE=y plus BIND_IPV4_PREFIX or BIND_IPV4_CIDR."
 
-  PORT="$DEFAULT_PORT"
-  USER_NAME="$DEFAULT_USER"
-  USER_PASS="$DEFAULT_PASS"
-  MAXCONN="$DEFAULT_MAXCONN"
-  MODE="$DEFAULT_MODE"
-  ENABLE_LOG="n"
+  PORT="${PORT:-$DEFAULT_PORT}"
+  USER_NAME="${USER_NAME:-$DEFAULT_USER}"
+  USER_PASS="${USER_PASS:-$DEFAULT_PASS}"
+  MAXCONN="${MAXCONN:-$DEFAULT_MAXCONN}"
+  MODE="${MODE:-$DEFAULT_MODE}"
+  ENABLE_LOG="${ENABLE_LOG:-n}"
+  normalize_bind_settings
   save_state
 
   install_deps
   build_install_3proxy
-  write_service
-  setup_ip_binding
+  if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    bind_ipv4_now
+  fi
   write_config
+  write_service
   apply_tuning
   open_firewall "$PORT"
   restart_service
   install_watchdog
 
-  green "全部完成。"
+  green "All done."
   show_info
   echo
   show_status
@@ -570,29 +637,35 @@ full_auto_install(){
 regen_config(){
   need_root
   load_state
-  setup_ip_binding || true
+  if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    bind_ipv4_now || true
+  fi
   write_config
   restart_service || true
 }
 
 modify_config(){
   load_state
-  echo "当前默认：端口=$PORT 用户=$USER_NAME 密码=$USER_PASS maxconn=$MAXCONN mode=$MODE"
-  read -r -p "端口 [$PORT]: " x; PORT="${x:-$PORT}"
-  read -r -p "用户名 [$USER_NAME]: " x; USER_NAME="${x:-$USER_NAME}"
-  read -r -p "密码 [$USER_PASS]: " x; USER_PASS="${x:-$USER_PASS}"
+  echo "Current: port=$PORT user=$USER_NAME pass=$USER_PASS maxconn=$MAXCONN mode=$MODE"
+  read -r -p "Port [$PORT]: " x; PORT="${x:-$PORT}"
+  read -r -p "Username [$USER_NAME]: " x; USER_NAME="${x:-$USER_NAME}"
+  read -r -p "Password [$USER_PASS]: " x; USER_PASS="${x:-$USER_PASS}"
   read -r -p "maxconn [$MAXCONN]: " x; MAXCONN="${x:-$MAXCONN}"
-  echo "模式：auto / wildcard / multiip"
-  read -r -p "模式 [$MODE]: " x; MODE="${x:-$MODE}"
-  read -r -p "是否自动绑定 IPv4 段 y/n [$BIND_ENABLE]: " x; BIND_ENABLE="${x:-$BIND_ENABLE}"
-  read -r -p "绑定前三段，例如 108.187.244 [$BIND_IPV4_PREFIX]: " x; BIND_IPV4_PREFIX="${x:-$BIND_IPV4_PREFIX}"
-  read -r -p "绑定开始尾号 [$BIND_START]: " x; BIND_START="${x:-$BIND_START}"
-  read -r -p "绑定结束尾号 [$BIND_END]: " x; BIND_END="${x:-$BIND_END}"
-  read -r -p "绑定网卡 auto/eno1 等 [$BIND_DEV]: " x; BIND_DEV="${x:-$BIND_DEV}"
-  read -r -p "3proxy 只使用此前缀出口，留空=全部公网IP [$CONFIG_IP_PREFIX]: " x; CONFIG_IP_PREFIX="${x:-$CONFIG_IP_PREFIX}"
+  echo "Mode: auto / wildcard / multiip"
+  read -r -p "Mode [$MODE]: " x; MODE="${x:-$MODE}"
+  read -r -p "Enable generic IP binding? y/n [$BIND_ENABLE]: " x; BIND_ENABLE="${x:-$BIND_ENABLE}"
+  if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
+    read -r -p "Bind IPv4 prefix, for example 108.187.244 [$BIND_IPV4_PREFIX]: " x; BIND_IPV4_PREFIX="${x:-$BIND_IPV4_PREFIX}"
+    BIND_IPV4_CIDR=""
+    read -r -p "Bind start [$BIND_START]: " x; BIND_START="${x:-$BIND_START}"
+    read -r -p "Bind end [$BIND_END]: " x; BIND_END="${x:-$BIND_END}"
+    read -r -p "Bind device, auto or interface name [$BIND_DEV]: " x; BIND_DEV="${x:-$BIND_DEV}"
+    read -r -p "Only use this bind range in config? y/n [$BIND_ONLY_RANGE]: " x; BIND_ONLY_RANGE="${x:-$BIND_ONLY_RANGE}"
+  fi
   ENABLE_LOG="n"
+  normalize_bind_settings
   save_state
-  setup_ip_binding || true
+  if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then bind_ipv4_now; fi
   write_config
   open_firewall "$PORT"
   restart_service
@@ -600,50 +673,58 @@ modify_config(){
 }
 
 uninstall_all(){
-  read -r -p "确认卸载3proxy？默认不卸载 [y/N]: " ans
+  read -r -p "Confirm uninstall 3proxy? Default no [y/N]: " ans
   ans="${ans:-n}"
-  [[ "$ans" =~ ^[Yy]$ ]] || { yellow "已取消"; return 0; }
+  [[ "$ans" =~ ^[Yy]$ ]] || { yellow "Cancelled"; return 0; }
   disable_watchdog || true
+  remove_bind_service || true
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
   systemctl disable "$SERVICE" >/dev/null 2>&1 || true
-  rm -f "$SERVICE_FILE" "$CONFIG_FILE" "$INSTALL_PATH" "$LOG_FILE" "$SYSCTL_FILE" "$BIND_SCRIPT" "$BIND_SERVICE"
+  rm -f "$SERVICE_FILE" "$CONFIG_FILE" "$INSTALL_PATH" "$LOG_FILE" "$SYSCTL_FILE"
   rm -rf "$OVR_DIR" "$STATE_DIR"
   systemctl daemon-reload
-  green "卸载完成。"
+  green "Uninstalled."
 }
 
 show_menu(){
-  clear
+  clear || true
   echo "=========================================="
-  echo "      3proxy SOCKS5 一键脚本 - 全默认版"
+  echo "      3proxy SOCKS5 one-click script"
+  echo "      generic version, no hard-coded IP"
   echo "=========================================="
-  echo "默认端口: ${DEFAULT_PORT}"
-  echo "默认账号/密码: ${DEFAULT_USER}/${DEFAULT_PASS}"
-  echo "默认 maxconn: ${DEFAULT_MAXCONN}"
-  echo "默认模式: auto，多IP自动独立出口，单IP自动 -i0.0.0.0"
-  echo "默认自动启用: 高并发优化 / 防火墙放行 / IP变动检测"
+  echo "Default port: ${DEFAULT_PORT}"
+  echo "Default user/pass: ${DEFAULT_USER}/${DEFAULT_PASS}"
+  echo "Default maxconn: ${DEFAULT_MAXCONN}"
+  echo "Default mode: auto"
+  echo "Generic IP binding: disabled unless configured"
   echo "------------------------------------------"
-  echo "1. 一键安装 / 重新编译安装（全默认自动启用）"
-  echo "2. 修改配置"
-  echo "3. 查看代理信息"
-  echo "4. 测试代理"
-  echo "5. 重启服务"
-  echo "6. 查看服务状态"
-  echo "7. 应用高并发优化"
-  echo "8. 启用 IP 变动检测"
-  echo "9. 关闭 IP 变动检测"
-  echo "10. 卸载"
-  echo "11. 重新绑定IP并重生配置"
-  echo "0. 退出"
+  echo "1. Install / rebuild install"
+  echo "2. Modify config"
+  echo "3. Show proxy info"
+  echo "4. Test proxy"
+  echo "5. Restart service"
+  echo "6. Show service status"
+  echo "7. Apply high concurrency tuning"
+  echo "8. Enable IP-change watchdog"
+  echo "9. Disable IP-change watchdog"
+  echo "10. Bind configured IPv4 range now"
+  echo "11. Remove generic bind service"
+  echo "12. Uninstall"
+  echo "0. Exit"
   echo "------------------------------------------"
 }
 
 main(){
-  if [[ "${1:-}" == "--regen" ]]; then regen_config; exit 0; fi
-  if [[ "${1:-}" == "--bindfix" || "${1:-}" == "--bind" ]]; then need_root; load_state; setup_ip_binding; write_config; restart_service || true; show_info; show_status; exit 0; fi
+  case "${1:-}" in
+    --help|-h) usage; exit 0 ;;
+    --regen) regen_config; exit 0 ;;
+    --bind|--bindfix) need_root; load_state; bind_ipv4_now; write_config; restart_service || true; show_info; exit 0 ;;
+    --status) need_root; show_status; verify_limits; exit 0 ;;
+    --info) need_root; show_info; exit 0 ;;
+  esac
+
   need_root
 
-  # 下载为 /root/acck.sh 时不会产生第二个脚本；从其他路径运行时才复制一份给 watchdog 使用。
   if [[ "$(readlink -f "$0")" != "$SELF_PATH" ]]; then
     cp -f "$(readlink -f "$0")" "$SELF_PATH" 2>/dev/null || true
     chmod +x "$SELF_PATH" 2>/dev/null || true
@@ -656,7 +737,7 @@ main(){
 
   while true; do
     show_menu
-    read -r -p "请输入选择 [0-10]: " choice
+    read -r -p "Choose [0-12]: " choice
     case "$choice" in
       1) full_auto_install; pause ;;
       2) modify_config; pause ;;
@@ -667,10 +748,11 @@ main(){
       7) apply_tuning; restart_service; verify_limits; pause ;;
       8) install_watchdog; pause ;;
       9) disable_watchdog; pause ;;
-      10) uninstall_all; pause ;;
-      11) setup_ip_binding; write_config; restart_service; show_info; show_status; pause ;;
+      10) load_state; bind_ipv4_now; write_config; restart_service || true; show_info; pause ;;
+      11) remove_bind_service; pause ;;
+      12) uninstall_all; pause ;;
       0) exit 0 ;;
-      *) red "无效输入"; sleep 1 ;;
+      *) red "Invalid input"; sleep 1 ;;
     esac
   done
 }
