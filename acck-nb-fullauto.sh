@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# 3proxy SOCKS5 full-auto installer - generic version
+# 3proxy SOCKS5 一键安装脚本 - 中文双模式版
 # Defaults: port 10898, user nb, password nb, maxconn 100000
-# Generic IP binding is disabled by default. Enable only when you explicitly set a range/prefix/CIDR.
+# 默认不启用 IPv4 段绑定；只有显式设置范围/prefix/CIDR 时才启用。
 
 set -Eeuo pipefail
 
@@ -76,36 +76,40 @@ need_root(){
   fi
 }
 
-pause(){ echo; read -r -p "Press Enter to return to menu..." _ || true; }
+pause(){ echo; read -r -p "按回车返回菜单..." _ || true; }
 
 usage(){
   cat <<EOF_USAGE
-Usage:
-  bash acck.sh --auto
-  bash acck.sh --regen
-  bash acck.sh --bind
-  bash acck.sh --bindfix
-  bash acck.sh --status
-  bash acck.sh --info
+用法：
+  bash acck.sh --auto             # 原版自动安装，使用默认参数
+  bash acck.sh --custom           # 自定义安装，只设置端口/账号/密码
+  bash acck.sh --regen            # 重新生成配置并重启
+  bash acck.sh --bind             # 重新绑定已配置 IPv4 段
+  bash acck.sh --bindfix          # 同 --bind
+  bash acck.sh --status           # 查看服务状态
+  bash acck.sh --info             # 查看代理信息
 
-Generic IP binding is disabled by default.
-Enable binding with environment variables:
+默认参数：
+  端口：10898
+  账号：nb
+  密码：nb
+  最大连接数：100000
+  模式：auto
+  IPv4 段绑定：默认关闭
 
+自定义安装只会询问：端口、账号、密码。
+其他参数全部使用原版自动安装默认值。
+
+如需手动启用 IPv4 段绑定，可用环境变量：
   BIND_ENABLE=y BIND_IPV4_PREFIX=108.187.244 BIND_START=1 BIND_END=254 bash acck.sh --auto
   BIND_ENABLE=y BIND_IPV4_CIDR=108.187.244.0/24 bash acck.sh --auto
 
-Optional variables:
-  BIND_DEV=eno1              # default: auto
-  BIND_ONLY_RANGE=y          # config uses only the configured bind range
-  PORT=10898 USER_NAME=nb USER_PASS=nb MAXCONN=100000 MODE=auto bash acck.sh --auto
-
-Modes:
-  auto      multi public IPs => per-IP socks lines; single public IP => wildcard
-  multiip   force per-IP socks lines
-  wildcard  one socks line, bind on 0.0.0.0
+模式说明：
+  auto      多个公网 IP 时生成多 IP socks；单公网 IP 时监听 0.0.0.0
+  multiip   强制每个公网 IP 生成一条 socks
+  wildcard  只生成一条 socks，监听 0.0.0.0
 EOF_USAGE
 }
-
 pkg_install(){
   if has_cmd apt-get; then
     export DEBIAN_FRONTEND=noninteractive
@@ -566,24 +570,24 @@ show_info(){
   count="$(grep -c '^socks ' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   cfg_count="$(get_config_ipv4_list | wc -l | awk '{print $1}')"
   em="$(effective_mode)"
-  echo "config file: $CONFIG_FILE"
-  echo "program path: $INSTALL_PATH"
-  echo "proxy type: SOCKS5"
-  echo "port: $PORT"
-  echo "username/password: $USER_NAME/$USER_PASS"
-  echo "maxconn: $MAXCONN"
-  echo "mode: $MODE -> $em"
-  echo "socks lines: $count"
-  echo "public IP from outside: ${pub:-failed}"
-  echo "config IPv4 count: $cfg_count"
-  echo "bind enable: $BIND_ENABLE"
-  echo "bind prefix/cidr: ${BIND_IPV4_PREFIX:-none} ${BIND_IPV4_CIDR:-}"
-  echo "bind range/dev: $BIND_START-$BIND_END / $BIND_DEV"
-  echo "bind only range: $BIND_ONLY_RANGE"
-  echo "local global IPv4:"
+  echo "配置文件: $CONFIG_FILE"
+  echo "程序路径: $INSTALL_PATH"
+  echo "代理类型: SOCKS5"
+  echo "端口: $PORT"
+  echo "账号/密码: $USER_NAME/$USER_PASS"
+  echo "最大连接数: $MAXCONN"
+  echo "模式: $MODE -> $em"
+  echo "socks 配置行数: $count"
+  echo "外网检测 IP: ${pub:-failed}"
+  echo "配置 IPv4 数量: $cfg_count"
+  echo "IPv4 段绑定: $BIND_ENABLE"
+  echo "绑定 prefix/cidr: ${BIND_IPV4_PREFIX:-none} ${BIND_IPV4_CIDR:-}"
+  echo "绑定范围/网卡: $BIND_START-$BIND_END / $BIND_DEV"
+  echo "只使用绑定范围生成配置: $BIND_ONLY_RANGE"
+  echo "本机 global IPv4:"
   get_all_global_ipv4 | sed 's/^/  - /' || true
   echo
-  echo "test command:"
+  echo "测试命令:"
   echo "curl -v --socks5 ${USER_NAME}:${USER_PASS}@${pub:-server_public_ip}:${PORT} http://example.com"
 }
 
@@ -591,19 +595,111 @@ test_proxy(){
   load_state
   local pub
   pub="$(current_public_ip)"
-  echo "Local test 127.0.0.1:${PORT}"
+  echo "本机测试 127.0.0.1:${PORT}"
   curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@127.0.0.1:${PORT}" http://ifconfig.me && echo || red "Local test failed"
   if [[ -n "$pub" ]]; then
-    echo "Public test ${pub}:${PORT}"
+    echo "公网测试 ${pub}:${PORT}"
     curl -4 -sS --connect-timeout 8 --max-time 15 --socks5 "${USER_NAME}:${USER_PASS}@${pub}:${PORT}" http://ifconfig.me && echo || red "Public test failed. Check security group/firewall."
   fi
 }
 
+
+original_auto_install(){
+  # 菜单选项 1：原版自动安装，使用内置默认参数。
+  PORT="$DEFAULT_PORT"
+  USER_NAME="$DEFAULT_USER"
+  USER_PASS="$DEFAULT_PASS"
+  MAXCONN="$DEFAULT_MAXCONN"
+  MODE="$DEFAULT_MODE"
+  ENABLE_LOG="n"
+
+  # 保持原版自动安装行为：默认不硬编码绑定 IP 段。
+  BIND_ENABLE="n"
+  BIND_IPV4_PREFIX=""
+  BIND_IPV4_CIDR=""
+  BIND_START="1"
+  BIND_END="254"
+  BIND_DEV="auto"
+  BIND_ONLY_RANGE="n"
+
+  full_auto_install
+}
+
+custom_install(){
+  clear || true
+  echo "=========================================="
+  echo "        3proxy 自定义安装"
+  echo "=========================================="
+  echo "这里只需要设置：端口、账号、密码。"
+  echo "其他参数全部使用原版自动安装默认值："
+  echo "  最大连接数：$DEFAULT_MAXCONN"
+  echo "  模式：$DEFAULT_MODE"
+  echo "  日志：关闭"
+  echo "  IPv4 段绑定：关闭"
+  echo "------------------------------------------"
+  echo "直接回车使用括号里的默认值。"
+  echo
+
+  PORT="$DEFAULT_PORT"
+  USER_NAME="$DEFAULT_USER"
+  USER_PASS="$DEFAULT_PASS"
+  MAXCONN="$DEFAULT_MAXCONN"
+  MODE="$DEFAULT_MODE"
+  ENABLE_LOG="n"
+
+  # 自定义安装不额外询问绑定相关配置，保持原版默认值。
+  BIND_ENABLE="n"
+  BIND_IPV4_PREFIX=""
+  BIND_IPV4_CIDR=""
+  BIND_START="1"
+  BIND_END="254"
+  BIND_DEV="auto"
+  BIND_ONLY_RANGE="n"
+
+  read -r -p "请输入代理端口 [$PORT]: " x
+  PORT="${x:-$PORT}"
+
+  read -r -p "请输入账号 [$USER_NAME]: " x
+  USER_NAME="${x:-$USER_NAME}"
+
+  read -r -p "请输入密码 [$USER_PASS]: " x
+  USER_PASS="${x:-$USER_PASS}"
+
+  if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+    red "端口无效：$PORT"
+    return 1
+  fi
+  if [[ -z "$USER_NAME" || -z "$USER_PASS" ]]; then
+    red "账号和密码不能为空。"
+    return 1
+  fi
+
+  normalize_bind_settings
+  save_state
+
+  echo
+  echo "即将使用以下参数安装："
+  echo "  端口：$PORT"
+  echo "  账号/密码：$USER_NAME/$USER_PASS"
+  echo "  最大连接数：$MAXCONN"
+  echo "  模式：$MODE"
+  echo "  IPv4 段绑定：$BIND_ENABLE"
+  echo
+
+  read -r -p "确认开始安装？[y/N]: " ans
+  ans="${ans:-n}"
+  if ! [[ "$ans" =~ ^[Yy]$ ]]; then
+    yellow "已取消。"
+    return 0
+  fi
+
+  full_auto_install
+}
 full_auto_install(){
   clear || true
-  echo "--- 3proxy full-auto install - generic version ---"
-  echo "port=${PORT:-$DEFAULT_PORT} user/pass=${USER_NAME:-$DEFAULT_USER}/${USER_PASS:-$DEFAULT_PASS} maxconn=${MAXCONN:-$DEFAULT_MAXCONN} mode=${MODE:-$DEFAULT_MODE}"
-  echo "IP binding default: disabled. Enable with BIND_ENABLE=y plus BIND_IPV4_PREFIX or BIND_IPV4_CIDR."
+  echo "--- 3proxy 自动安装 - 通用版 ---"
+  echo "端口=${PORT:-$DEFAULT_PORT} 账号/密码=${USER_NAME:-$DEFAULT_USER}/${USER_PASS:-$DEFAULT_PASS} 最大连接数=${MAXCONN:-$DEFAULT_MAXCONN} 模式=${MODE:-$DEFAULT_MODE}"
+  echo "IPv4 段绑定默认关闭；需要时可通过 BIND_ENABLE=y 和 BIND_IPV4_PREFIX/BIND_IPV4_CIDR 启用。"
 
   PORT="${PORT:-$DEFAULT_PORT}"
   USER_NAME="${USER_NAME:-$DEFAULT_USER}"
@@ -626,7 +722,7 @@ full_auto_install(){
   restart_service
   install_watchdog
 
-  green "All done."
+  green "安装完成。"
   show_info
   echo
   show_status
@@ -646,14 +742,14 @@ regen_config(){
 
 modify_config(){
   load_state
-  echo "Current: port=$PORT user=$USER_NAME pass=$USER_PASS maxconn=$MAXCONN mode=$MODE"
-  read -r -p "Port [$PORT]: " x; PORT="${x:-$PORT}"
-  read -r -p "Username [$USER_NAME]: " x; USER_NAME="${x:-$USER_NAME}"
-  read -r -p "Password [$USER_PASS]: " x; USER_PASS="${x:-$USER_PASS}"
-  read -r -p "maxconn [$MAXCONN]: " x; MAXCONN="${x:-$MAXCONN}"
-  echo "Mode: auto / wildcard / multiip"
-  read -r -p "Mode [$MODE]: " x; MODE="${x:-$MODE}"
-  read -r -p "Enable generic IP binding? y/n [$BIND_ENABLE]: " x; BIND_ENABLE="${x:-$BIND_ENABLE}"
+  echo "当前配置: 端口=$PORT 账号=$USER_NAME 密码=$USER_PASS 最大连接数=$MAXCONN 模式=$MODE"
+  read -r -p "端口 [$PORT]: " x; PORT="${x:-$PORT}"
+  read -r -p "账号 [$USER_NAME]: " x; USER_NAME="${x:-$USER_NAME}"
+  read -r -p "密码 [$USER_PASS]: " x; USER_PASS="${x:-$USER_PASS}"
+  read -r -p "最大连接数 [$MAXCONN]: " x; MAXCONN="${x:-$MAXCONN}"
+  echo "模式: auto / wildcard / multiip"
+  read -r -p "模式 [$MODE]: " x; MODE="${x:-$MODE}"
+  read -r -p "是否启用 IPv4 段绑定？y/n [$BIND_ENABLE]: " x; BIND_ENABLE="${x:-$BIND_ENABLE}"
   if [[ "$BIND_ENABLE" =~ ^[Yy]$ ]]; then
     read -r -p "Bind IPv4 prefix, for example 108.187.244 [$BIND_IPV4_PREFIX]: " x; BIND_IPV4_PREFIX="${x:-$BIND_IPV4_PREFIX}"
     BIND_IPV4_CIDR=""
@@ -673,9 +769,9 @@ modify_config(){
 }
 
 uninstall_all(){
-  read -r -p "Confirm uninstall 3proxy? Default no [y/N]: " ans
+  read -r -p "确认卸载 3proxy？默认不卸载 [y/N]: " ans
   ans="${ans:-n}"
-  [[ "$ans" =~ ^[Yy]$ ]] || { yellow "Cancelled"; return 0; }
+  [[ "$ans" =~ ^[Yy]$ ]] || { yellow "已取消"; return 0; }
   disable_watchdog || true
   remove_bind_service || true
   systemctl stop "$SERVICE" >/dev/null 2>&1 || true
@@ -683,37 +779,37 @@ uninstall_all(){
   rm -f "$SERVICE_FILE" "$CONFIG_FILE" "$INSTALL_PATH" "$LOG_FILE" "$SYSCTL_FILE"
   rm -rf "$OVR_DIR" "$STATE_DIR"
   systemctl daemon-reload
-  green "Uninstalled."
+  green "已卸载。"
 }
 
 show_menu(){
   clear || true
   echo "=========================================="
-  echo "      3proxy SOCKS5 one-click script"
-  echo "      generic version, no hard-coded IP"
+  echo "        3proxy SOCKS5 一键脚本"
+  echo "        中文双模式版，无硬编码 IP"
   echo "=========================================="
-  echo "Default port: ${DEFAULT_PORT}"
-  echo "Default user/pass: ${DEFAULT_USER}/${DEFAULT_PASS}"
-  echo "Default maxconn: ${DEFAULT_MAXCONN}"
-  echo "Default mode: auto"
-  echo "Generic IP binding: disabled unless configured"
+  echo "默认端口：${DEFAULT_PORT}"
+  echo "默认账号/密码：${DEFAULT_USER}/${DEFAULT_PASS}"
+  echo "默认最大连接数：${DEFAULT_MAXCONN}"
+  echo "默认模式：auto"
+  echo "IPv4 段绑定：默认关闭"
   echo "------------------------------------------"
-  echo "1. Install / rebuild install"
-  echo "2. Modify config"
-  echo "3. Show proxy info"
-  echo "4. Test proxy"
-  echo "5. Restart service"
-  echo "6. Show service status"
-  echo "7. Apply high concurrency tuning"
-  echo "8. Enable IP-change watchdog"
-  echo "9. Disable IP-change watchdog"
-  echo "10. Bind configured IPv4 range now"
-  echo "11. Remove generic bind service"
-  echo "12. Uninstall"
-  echo "0. Exit"
+  echo "1. 原版自动安装（使用默认参数）"
+  echo "2. 自定义安装（只设置端口/账号/密码）"
+  echo "3. 修改配置"
+  echo "4. 查看代理信息"
+  echo "5. 测试代理"
+  echo "6. 重启服务"
+  echo "7. 查看服务状态"
+  echo "8. 应用高并发系统参数"
+  echo "9. 启用 IP 变化自动刷新"
+  echo "10. 关闭 IP 变化自动刷新"
+  echo "11. 立即绑定已配置 IPv4 段"
+  echo "12. 移除 IPv4 段绑定服务"
+  echo "13. 卸载"
+  echo "0. 退出"
   echo "------------------------------------------"
 }
-
 main(){
   case "${1:-}" in
     --help|-h) usage; exit 0 ;;
@@ -730,29 +826,35 @@ main(){
     chmod +x "$SELF_PATH" 2>/dev/null || true
   fi
 
+  if [[ "${1:-}" == "--custom" || "${1:-}" == "--custom-install" ]]; then
+    custom_install
+    exit 0
+  fi
+
   if [[ "${1:-}" == "--auto" || "${1:-}" == "--install" ]]; then
-    full_auto_install
+    original_auto_install
     exit 0
   fi
 
   while true; do
     show_menu
-    read -r -p "Choose [0-12]: " choice
+    read -r -p "请选择 [0-13]: " choice
     case "$choice" in
-      1) full_auto_install; pause ;;
-      2) modify_config; pause ;;
-      3) show_info; pause ;;
-      4) test_proxy; pause ;;
-      5) load_state; restart_service; show_status; verify_limits; pause ;;
-      6) load_state; show_status; verify_limits; pause ;;
-      7) apply_tuning; restart_service; verify_limits; pause ;;
-      8) install_watchdog; pause ;;
-      9) disable_watchdog; pause ;;
-      10) load_state; bind_ipv4_now; write_config; restart_service || true; show_info; pause ;;
-      11) remove_bind_service; pause ;;
-      12) uninstall_all; pause ;;
+      1) original_auto_install; pause ;;
+      2) custom_install; pause ;;
+      3) modify_config; pause ;;
+      4) show_info; pause ;;
+      5) test_proxy; pause ;;
+      6) load_state; restart_service; show_status; verify_limits; pause ;;
+      7) load_state; show_status; verify_limits; pause ;;
+      8) apply_tuning; restart_service; verify_limits; pause ;;
+      9) install_watchdog; pause ;;
+      10) disable_watchdog; pause ;;
+      11) load_state; bind_ipv4_now; write_config; restart_service || true; show_info; pause ;;
+      12) remove_bind_service; pause ;;
+      13) uninstall_all; pause ;;
       0) exit 0 ;;
-      *) red "Invalid input"; sleep 1 ;;
+      *) red "输入无效"; sleep 1 ;;
     esac
   done
 }
