@@ -88,6 +88,7 @@ usage(){
   bash acck.sh --bindfix          # 同 --bind
   bash acck.sh --status           # 查看服务状态
   bash acck.sh --info             # 查看代理信息
+  bash acck.sh --check-ipv4       # 检测全部公网 IPv4、监听、本机出口、代理出口
 
 默认参数：
   端口：10898
@@ -604,6 +605,176 @@ test_proxy(){
 }
 
 
+final_connectivity_check(){
+  # 安装/重启完成后的最终检测：检测所有已绑定公网 IPv4、本机出口、3proxy 配置、监听、代理出口。
+  # 这里故意不让检测失败中断脚本，只输出清晰结果。
+  set +e
+
+  load_state >/dev/null 2>&1 || true
+
+  local port config dev user_name user_pass ip out result
+  local public_file listen_file local_file proxy_file
+  local public_count local_fail_count proxy_fail_count cfg_fail_count listen_fail_count
+  local local_ok local_fail proxy_ok proxy_fail cfg_ok cfg_fail listen_ok listen_fail
+
+  port="${PORT:-$DEFAULT_PORT}"
+  config="$CONFIG_FILE"
+  dev="$(detect_default_dev)"
+  [ -n "$dev" ] || dev="unknown"
+
+  user_name="$(grep '^users ' "$config" 2>/dev/null | head -n1 | sed -E 's/^users ([^:]+):CL:.*/\1/')"
+  user_pass="$(grep '^users ' "$config" 2>/dev/null | head -n1 | sed -E 's/^users [^:]+:CL:(.*)$/\1/')"
+  [ -z "$user_name" ] && user_name="${USER_NAME:-$DEFAULT_USER}"
+  [ -z "$user_pass" ] && user_pass="${USER_PASS:-$DEFAULT_PASS}"
+
+  public_file="/tmp/3proxy_all_public_ipv4_check.txt"
+  listen_file="/tmp/3proxy_listen_${port}_check.txt"
+  local_file="/tmp/3proxy_local_out_${port}_result.txt"
+  proxy_file="/tmp/3proxy_proxy_out_${port}_result.txt"
+
+  echo
+  echo "========== 最终自动检测：IPv4 / 监听 / 出口 =========="
+  echo "DEV=$dev"
+  echo "PORT=$port"
+  echo "USER=$user_name"
+  echo
+
+  echo "========== 1. 当前机器全部公网 IPv4 =========="
+  get_public_like_ipv4 | sort -V -u | tee "$public_file"
+  public_count="$(wc -l <"$public_file" 2>/dev/null || echo 0)"
+  echo
+  echo "public_count=$public_count"
+
+  if [ "$public_count" -eq 0 ]; then
+    red "FAIL: 没有检测到公网 IPv4，跳过代理出口检测。"
+    return 0
+  fi
+
+  echo
+  echo "========== 2. 3proxy socks 配置 =========="
+  if [ -f "$config" ]; then
+    grep '^socks ' "$config" || echo "FAIL: 没有 socks 配置行"
+  else
+    echo "FAIL: $config 不存在"
+  fi
+
+  echo
+  echo "========== 3. 3proxy 监听 =========="
+  ss -lntp | grep ":$port" | tee "$listen_file"
+  if [ ! -s "$listen_file" ]; then
+    echo "FAIL: 没有监听 $port 端口"
+  fi
+
+  echo
+  echo "========== 4. 配置/监听逐 IP 检查 =========="
+  cfg_fail_count=0
+  listen_fail_count=0
+
+  while read -r ip; do
+    [ -z "$ip" ] && continue
+
+    cfg_ok="NO"
+    listen_ok="NO"
+
+    grep -q -- "-i${ip}" "$config" 2>/dev/null && cfg_ok="YES"
+    grep -q "${ip}:${port}" "$listen_file" 2>/dev/null && listen_ok="YES"
+
+    if [ "$cfg_ok" = "YES" ]; then
+      echo "OK   配置存在: $ip"
+    else
+      echo "FAIL 配置缺失: $ip"
+      cfg_fail_count=$((cfg_fail_count+1))
+    fi
+
+    if [ "$listen_ok" = "YES" ]; then
+      echo "OK   正在监听: $ip:$port"
+    else
+      echo "FAIL 未监听: $ip:$port"
+      listen_fail_count=$((listen_fail_count+1))
+    fi
+  done <"$public_file"
+
+  echo
+  echo "========== 5. 每个 IPv4 本机出口测试 =========="
+  : >"$local_file"
+  local_fail_count=0
+
+  while read -r ip; do
+    [ -z "$ip" ] && continue
+
+    out="$(curl -4 -sS --connect-timeout 8 --max-time 15 --interface "$ip" https://api.ipify.org 2>&1 || true)"
+
+    if [ "$out" = "$ip" ]; then
+      echo "OK   本机出口正常  ip=$ip 出口=$out"
+      echo "LOCAL_OK $ip" >>"$local_file"
+    else
+      echo "FAIL 本机出口异常  ip=$ip 结果=$out"
+      echo "LOCAL_FAIL $ip $out" >>"$local_file"
+      local_fail_count=$((local_fail_count+1))
+    fi
+  done <"$public_file"
+
+  echo
+  echo "========== 6. 每个 IPv4 代理出口测试 =========="
+  : >"$proxy_file"
+  proxy_fail_count=0
+
+  while read -r ip; do
+    [ -z "$ip" ] && continue
+
+    if ! grep -q "${ip}:${port}" "$listen_file" 2>/dev/null; then
+      echo "FAIL 代理未监听    proxy=$ip:$port"
+      echo "PROXY_FAIL $ip not_listening" >>"$proxy_file"
+      proxy_fail_count=$((proxy_fail_count+1))
+      continue
+    fi
+
+    result="$(curl -4 -sS --connect-timeout 10 --max-time 20 --socks5-hostname "${user_name}:${user_pass}@${ip}:${port}" https://api.ipify.org 2>&1 || true)"
+
+    if [ "$result" = "$ip" ]; then
+      echo "OK   代理出口正常  proxy=$ip:$port 出口=$result"
+      echo "PROXY_OK $ip" >>"$proxy_file"
+    else
+      echo "FAIL 代理出口异常  proxy=$ip:$port 结果=$result"
+      echo "PROXY_FAIL $ip $result" >>"$proxy_file"
+      proxy_fail_count=$((proxy_fail_count+1))
+    fi
+  done <"$public_file"
+
+  echo
+  echo "========== 7. 汇总 =========="
+  echo "公网IPv4数量=$public_count"
+  echo "配置缺失数量=$cfg_fail_count"
+  echo "监听失败数量=$listen_fail_count"
+  echo "本机出口失败数量=$local_fail_count"
+  echo "代理出口失败数量=$proxy_fail_count"
+
+  echo
+  echo "本机出口失败列表："
+  grep '^LOCAL_FAIL ' "$local_file" 2>/dev/null || echo "无"
+
+  echo
+  echo "代理出口失败列表："
+  grep '^PROXY_FAIL ' "$proxy_file" 2>/dev/null || echo "无"
+
+  echo
+  echo "========== 8. 最终判断 =========="
+  if [ "$cfg_fail_count" -eq 0 ] && [ "$listen_fail_count" -eq 0 ] && [ "$local_fail_count" -eq 0 ] && [ "$proxy_fail_count" -eq 0 ]; then
+    green "OK: 全部 IPv4 已配置、已监听，本机出口和代理出口都正常。"
+  elif [ "$cfg_fail_count" -gt 0 ] || [ "$listen_fail_count" -gt 0 ]; then
+    red "FAIL: 有 IPv4 没有写入 3proxy 配置或没有监听，需要重新生成多 IP 配置。"
+  elif [ "$local_fail_count" -gt 0 ]; then
+    red "FAIL: 有 IPv4 本机出口异常，可能是上游路由、源地址校验或服务商未真正分配到本机。"
+  elif [ "$proxy_fail_count" -gt 0 ]; then
+    red "FAIL: 本机出口正常但代理出口异常，请检查 3proxy 配置、认证、防火墙或安全组。"
+  else
+    yellow "WARN: 检测状态不完整，请查看上方详细输出。"
+  fi
+
+  return 0
+}
+
+
 original_auto_install(){
   # 菜单选项 1：原版自动安装，使用内置默认参数。
   PORT="$DEFAULT_PORT"
@@ -728,6 +899,7 @@ full_auto_install(){
   show_status
   echo
   verify_limits
+  final_connectivity_check || true
 }
 
 regen_config(){
@@ -806,7 +978,8 @@ show_menu(){
   echo "10. 关闭 IP 变化自动刷新"
   echo "11. 立即绑定已配置 IPv4 段"
   echo "12. 移除 IPv4 段绑定服务"
-  echo "13. 卸载"
+  echo "13. 检测全部公网 IPv4/代理出口"
+  echo "14. 卸载"
   echo "0. 退出"
   echo "------------------------------------------"
 }
@@ -817,6 +990,7 @@ main(){
     --bind|--bindfix) need_root; load_state; bind_ipv4_now; write_config; restart_service || true; show_info; exit 0 ;;
     --status) need_root; show_status; verify_limits; exit 0 ;;
     --info) need_root; show_info; exit 0 ;;
+    --check-ipv4|--check) need_root; load_state; final_connectivity_check; exit 0 ;;
   esac
 
   need_root
@@ -838,7 +1012,7 @@ main(){
 
   while true; do
     show_menu
-    read -r -p "请选择 [0-13]: " choice
+    read -r -p "请选择 [0-14]: " choice
     case "$choice" in
       1) original_auto_install; pause ;;
       2) custom_install; pause ;;
@@ -852,7 +1026,8 @@ main(){
       10) disable_watchdog; pause ;;
       11) load_state; bind_ipv4_now; write_config; restart_service || true; show_info; pause ;;
       12) remove_bind_service; pause ;;
-      13) uninstall_all; pause ;;
+      13) load_state; final_connectivity_check; pause ;;
+      14) uninstall_all; pause ;;
       0) exit 0 ;;
       *) red "输入无效"; sleep 1 ;;
     esac
